@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Benchmark models via Vercel AI Gateway to build a difficulty->model routing table.
+// Benchmark models on Fireworks AI (AMD CloudCredits) to build a difficulty->model routing table.
 //
-// Usage:  AI_GATEWAY_API_KEY=... node bench.mjs        (or put the key in .env)
+// Usage:  FIREWORKS_API_KEY=... node bench.mjs        (or put the key in .env)
 // Output: results.json (raw runs), routing.json (tier -> model), table on stdout.
 
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -9,9 +9,10 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const GATEWAY = "https://ai-gateway.vercel.sh/v1";
+const GATEWAY = "https://api.fireworks.ai/inference/v1";
 
-// The five candidate models (matched by suffix against the gateway catalog).
+// The five candidate models (matched by suffix against the Fireworks catalog,
+// e.g. accounts/fireworks/models/minimax-m3).
 const WANTED = [
   "minimax-m3",
   "kimi-k2p7-code",
@@ -19,6 +20,12 @@ const WANTED = [
   "gemma-4-26b-a4b-it",
   "gemma-4-31b-it-nvfp4",
 ];
+
+// Fireworks' models endpoint doesn't expose pricing — fill in $/1M tokens from
+// https://fireworks.ai/pricing. Unpriced models rank by latency in routing.
+const PRICES = {
+  // "minimax-m3": { in: 0.0, out: 0.0 },
+};
 
 // ---------- tasks ----------
 // grade kinds: "number" (last number in reply), "contains" (substring, case-insensitive),
@@ -71,12 +78,12 @@ assert.strictEqual(evalExpr("(1+2)*(3+4)"), 21);` },
 
 // ---------- plumbing ----------
 function loadKey() {
-  if (process.env.AI_GATEWAY_API_KEY) return process.env.AI_GATEWAY_API_KEY;
+  if (process.env.FIREWORKS_API_KEY) return process.env.FIREWORKS_API_KEY;
   try {
-    const m = readFileSync(".env", "utf8").match(/^AI_GATEWAY_API_KEY=(.+)$/m);
+    const m = readFileSync(".env", "utf8").match(/^FIREWORKS_API_KEY=(.+)$/m);
     if (m) return m[1].trim().replace(/^["']|["']$/g, "");
   } catch {}
-  console.error("Set AI_GATEWAY_API_KEY (env or .env file).");
+  console.error("Set FIREWORKS_API_KEY (env or .env file).");
   process.exit(1);
 }
 const KEY = loadKey();
@@ -89,10 +96,13 @@ async function resolveModels() {
   return WANTED.map((want) => {
     const hit = data.find((m) => m.id === want || m.id.endsWith(`/${want}`));
     if (!hit) {
-      console.error(`⚠ model not found in gateway catalog: ${want}`);
+      console.error(`⚠ model not found in Fireworks catalog: ${want}`);
       return null;
     }
-    return { want, id: hit.id, pricing: hit.pricing ?? null };
+    // prefer catalog pricing if Fireworks ever returns it, else the PRICES table
+    const p = hit.pricing ?? (PRICES[want] &&
+      { input: PRICES[want].in / 1e6, output: PRICES[want].out / 1e6 });
+    return { want, id: hit.id, pricing: p ?? null };
   }).filter(Boolean);
 }
 
@@ -103,7 +113,7 @@ async function ask(modelId, prompt) {
       const res = await fetch(`${GATEWAY}/chat/completions`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ model: modelId, messages: [{ role: "user", content: prompt }] }),
+        body: JSON.stringify({ model: modelId, max_tokens: 8192, messages: [{ role: "user", content: prompt }] }),
         signal: AbortSignal.timeout(180_000),
       });
       if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
@@ -185,7 +195,8 @@ const summary = models.map((m) => {
     const rs = mine.filter((r) => r.tier === t);
     return [t, rs.filter((r) => r.pass).length / rs.length];
   }));
-  const totalCost = mine.reduce((s, r) => s + (r.cost ?? 0), 0);
+  const priced = mine.some((r) => r.cost != null);
+  const totalCost = priced ? mine.reduce((s, r) => s + (r.cost ?? 0), 0) : null;
   const avgMs = Math.round(mine.reduce((s, r) => s + r.ms, 0) / mine.length);
   return { model: m.want, ...byTier, avgMs, totalCost };
 });
@@ -193,12 +204,13 @@ const summary = models.map((m) => {
 const pct = (x) => `${Math.round(x * 100)}%`;
 console.log("\nmodel                  easy   med    hard   avg ms   cost ($)");
 for (const s of summary)
-  console.log(`${s.model.padEnd(22)} ${pct(s.easy).padEnd(6)} ${pct(s.medium).padEnd(6)} ${pct(s.hard).padEnd(6)} ${String(s.avgMs).padEnd(8)} ${s.totalCost.toFixed(4)}`);
+  console.log(`${s.model.padEnd(22)} ${pct(s.easy).padEnd(6)} ${pct(s.medium).padEnd(6)} ${pct(s.hard).padEnd(6)} ${String(s.avgMs).padEnd(8)} ${s.totalCost?.toFixed(4) ?? "n/a"}`);
 
-// routing: per tier, cheapest model that passes >=2/3 of that tier; else highest scorer
+// routing: per tier, cheapest (then fastest) model passing >=2/3 of that tier; else highest scorer
 const routing = {};
 for (const t of tiers) {
-  const ok = summary.filter((s) => s[t] >= 2 / 3).sort((a, b) => a.totalCost - b.totalCost);
+  const ok = summary.filter((s) => s[t] >= 2 / 3)
+    .sort((a, b) => (a.totalCost ?? Infinity) - (b.totalCost ?? Infinity) || a.avgMs - b.avgMs);
   routing[t] = (ok[0] ?? [...summary].sort((a, b) => b[t] - a[t])[0]).model;
 }
 writeFileSync("routing.json", JSON.stringify(routing, null, 2));

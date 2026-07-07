@@ -93,17 +93,22 @@ async function resolveModels() {
   const res = await fetch(`${GATEWAY}/models`, { headers });
   if (!res.ok) throw new Error(`models list failed: ${res.status} ${await res.text()}`);
   const { data } = await res.json();
-  return WANTED.map((want) => {
+  const out = [];
+  for (const want of WANTED) {
     const hit = data.find((m) => m.id === want || m.id.endsWith(`/${want}`));
+    const id = hit?.id ?? `accounts/fireworks/models/${want}`;
     if (!hit) {
-      console.error(`⚠ model not found in Fireworks catalog: ${want}`);
-      return null;
+      // Fireworks' list endpoint omits some serverless models — probe directly
+      const probe = await fetch(`${GATEWAY}/chat/completions`, {
+        method: "POST", headers,
+        body: JSON.stringify({ model: id, max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
+      });
+      if (!probe.ok) { console.error(`⚠ not available on Fireworks (needs a dedicated deployment?): ${want}`); continue; }
     }
-    // prefer catalog pricing if Fireworks ever returns it, else the PRICES table
-    const p = hit.pricing ?? (PRICES[want] &&
-      { input: PRICES[want].in / 1e6, output: PRICES[want].out / 1e6 });
-    return { want, id: hit.id, pricing: p ?? null };
-  }).filter(Boolean);
+    const p = PRICES[want] && { input: PRICES[want].in / 1e6, output: PRICES[want].out / 1e6 };
+    out.push({ want, id, pricing: p ?? null });
+  }
+  return out;
 }
 
 async function ask(modelId, prompt) {
@@ -118,8 +123,11 @@ async function ask(modelId, prompt) {
       });
       if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
       const j = await res.json();
+      const msg = j.choices?.[0]?.message ?? {};
       return {
-        text: j.choices?.[0]?.message?.content ?? "",
+        // reasoning models (minimax-m3) put final answer in content; fall back
+        // to reasoning_content if the answer got cut off mid-think
+        text: msg.content || msg.reasoning_content || "",
         usage: j.usage ?? {},
         ms: Math.round(performance.now() - t0),
       };
